@@ -81,6 +81,17 @@ def parser() -> ArgumentParser:
     receipt.add_argument("key")
     demo = commands.add_parser("demo")
     demo.add_argument("--workspace", default="fixtures")
+    anomaly = commands.add_parser("register-anomaly")
+    anomaly.add_argument("contract", help="local UTF-8 JSON anomaly rule")
+    commands.add_parser("anomaly-rules")
+    commands.add_parser("baseline-epochs")
+    epoch = commands.add_parser("baseline-epoch")
+    epoch.add_argument("epoch_id", type=int)
+    commands.add_parser("baseline-pending")
+    batch_baseline = commands.add_parser("batch-baseline")
+    batch_baseline.add_argument("batch", type=int)
+    confirm = commands.add_parser("confirm-baseline")
+    confirm.add_argument("assessment_id", type=int)
     return root
 
 
@@ -135,6 +146,20 @@ def execute(args: Namespace) -> Any:
             return service.register_source(read_json(args.contract))
         if args.command == "register-unit":
             return service.register_unit(read_json(args.contract))
+        if args.command == "register-anomaly":
+            return service.register_anomaly_rule(read_json(args.contract))
+        if args.command == "anomaly-rules":
+            return {"rules": service.baseline.rules()}
+        if args.command == "baseline-epochs":
+            return {"epochs": service.baseline_epochs()}
+        if args.command == "baseline-epoch":
+            return service.baseline_epoch(args.epoch_id)
+        if args.command == "baseline-pending":
+            return {"pending": service.baseline_pending()}
+        if args.command == "batch-baseline":
+            return service.batch_baseline(args.batch)
+        if args.command == "confirm-baseline":
+            return service.confirm_baseline(args.assessment_id)
         if args.command == "ingest":
             return service.ingest(args.manifest)
         if args.command == "approve":

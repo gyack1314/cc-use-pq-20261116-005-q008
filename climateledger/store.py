@@ -41,7 +41,31 @@ CREATE TABLE IF NOT EXISTS release_entries (
     PRIMARY KEY(version, source, indicator, period), FOREIGN KEY(version) REFERENCES releases(version));
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS anomaly_rules (
+    indicator TEXT PRIMARY KEY, sigma_threshold TEXT NOT NULL, min_baseline_points INTEGER NOT NULL,
+    min_delta TEXT, created_at TEXT NOT NULL, FOREIGN KEY(indicator) REFERENCES indicators(key));
+CREATE TABLE IF NOT EXISTS baseline_epochs (
+    id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, trigger_batch_id INTEGER NOT NULL,
+    trigger_revision INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL,
+    corrected_periods TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+    FOREIGN KEY(trigger_batch_id) REFERENCES batches(id));
+CREATE TABLE IF NOT EXISTS baseline_assessments (
+    id INTEGER PRIMARY KEY, epoch_id INTEGER NOT NULL, batch_id INTEGER NOT NULL,
+    prior_status TEXT NOT NULL, updated_status TEXT NOT NULL,
+    prior_findings TEXT NOT NULL, updated_findings TEXT NOT NULL,
+    jump_evidence TEXT NOT NULL, needs_confirmation INTEGER NOT NULL, applied INTEGER NOT NULL DEFAULT 0,
+    confirmed_at TEXT, created_at TEXT NOT NULL, UNIQUE(epoch_id, batch_id),
+    FOREIGN KEY(epoch_id) REFERENCES baseline_epochs(id),
+    FOREIGN KEY(batch_id) REFERENCES batches(id));
+CREATE INDEX IF NOT EXISTS baseline_assessments_batch ON baseline_assessments(batch_id, epoch_id);
 """
+
+# Each migration is (table, ALTER statement). The target table's existing
+# columns decide whether the column still needs to be added.
+SCHEMA_MIGRATIONS = (
+    ("batches", "ALTER TABLE batches ADD COLUMN baseline_epoch_id INTEGER"),
+    ("anomaly_rules", "ALTER TABLE anomaly_rules ADD COLUMN min_delta TEXT"),
+)
 
 
 def utc_now() -> str:
@@ -58,6 +82,14 @@ class LedgerStore:
         self.connection.execute("PRAGMA busy_timeout=20000")
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, statement in SCHEMA_MIGRATIONS:
+            existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+            column = statement.split("ADD COLUMN", 1)[1].strip().split()[0]
+            if column not in existing:
+                self.connection.execute(statement)
 
     def close(self) -> None:
         self.connection.close()
@@ -245,3 +277,141 @@ class LedgerStore:
                                     (version, batch_id))
             self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest})
             return self.release(version)
+
+    # ------------------------------------------------------------------
+    # Reference baseline: anomaly rules, epochs and re-assessments
+    # ------------------------------------------------------------------
+    def upsert_anomaly_rule(self, indicator: str, sigma_threshold: str,
+                            min_baseline_points: int, min_delta: str | None = None) -> dict[str, Any]:
+        with self.transaction():
+            self.connection.execute(
+                "INSERT INTO anomaly_rules(indicator,sigma_threshold,min_baseline_points,min_delta,created_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(indicator) DO UPDATE SET "
+                "sigma_threshold=excluded.sigma_threshold, "
+                "min_baseline_points=excluded.min_baseline_points, "
+                "min_delta=excluded.min_delta",
+                (indicator, sigma_threshold, min_baseline_points, min_delta, utc_now()))
+            self.event("register_anomaly_rule", indicator,
+                       {"sigma_threshold": sigma_threshold, "min_baseline_points": min_baseline_points,
+                        "min_delta": min_delta})
+            return self.get_anomaly_rule(indicator)
+
+    def get_anomaly_rule(self, indicator: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM anomaly_rules WHERE indicator=?", (indicator,)).fetchone()
+        return dict(row) if row else None
+
+    def list_anomaly_rules(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM anomaly_rules ORDER BY indicator")]
+
+    def baseline_epoch(self, epoch_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM baseline_epochs WHERE id=?", (epoch_id,)).fetchone()
+        if row is None:
+            raise ContractError("unknown_epoch", f"baseline epoch {epoch_id} does not exist")
+        result = dict(row)
+        result["corrected_periods"] = json.loads(result["corrected_periods"])
+        return result
+
+    def list_baseline_epochs(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM baseline_epochs ORDER BY id")
+        results = []
+        for row in rows:
+            result = dict(row)
+            result["corrected_periods"] = json.loads(result["corrected_periods"])
+            results.append(result)
+        return results
+
+    def insert_baseline_epoch(self, *, trigger_batch_id: int, trigger_revision: int, source: str,
+                              indicator: str, corrected_periods: list[dict[str, Any]],
+                              idempotency_key: str, status: str = "open") -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO baseline_epochs(created_at,trigger_batch_id,trigger_revision,source,indicator,"
+            "corrected_periods,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+            (utc_now(), trigger_batch_id, trigger_revision, source, indicator,
+             canonical_bytes(corrected_periods).decode(), status, idempotency_key))
+        epoch_id = cursor.lastrowid
+        self.event("baseline_epoch", f"epoch:{epoch_id}",
+                   {"trigger_batch_id": trigger_batch_id, "source": source, "indicator": indicator,
+                    "corrected_periods": corrected_periods, "idempotency_key": idempotency_key})
+        return self.baseline_epoch(epoch_id)
+
+    def mark_baseline_epoch(self, epoch_id: int, status: str) -> None:
+        self.connection.execute("UPDATE baseline_epochs SET status=? WHERE id=?", (status, epoch_id))
+        self.event("baseline_epoch_status", f"epoch:{epoch_id}", {"status": status})
+
+    def record_baseline_assessment(self, *, epoch_id: int, batch_id: int, prior_status: str,
+                                   updated_status: str, prior_findings: list[dict[str, Any]],
+                                   updated_findings: list[dict[str, Any]],
+                                   jump_evidence: list[dict[str, Any]], needs_confirmation: bool,
+                                   applied: bool) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO baseline_assessments(epoch_id,batch_id,prior_status,updated_status,"
+            "prior_findings,updated_findings,jump_evidence,needs_confirmation,applied,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (epoch_id, batch_id, prior_status, updated_status,
+             canonical_bytes(prior_findings).decode(), canonical_bytes(updated_findings).decode(),
+             canonical_bytes(jump_evidence).decode(), 1 if needs_confirmation else 0,
+             1 if applied else 0, utc_now()))
+        return self.baseline_assessment(cursor.lastrowid)
+
+    def baseline_assessment(self, assessment_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM baseline_assessments WHERE id=?",
+                                      (assessment_id,)).fetchone()
+        if row is None:
+            raise ContractError("unknown_assessment", f"baseline assessment {assessment_id} does not exist")
+        result = self._assessment_row(row)
+        result["confirmed_at"] = row["confirmed_at"]
+        return result
+
+    def baseline_assessments_for_epoch(self, epoch_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM baseline_assessments WHERE epoch_id=? ORDER BY batch_id", (epoch_id,))
+        return [self._assessment_row(row) for row in rows]
+
+    def latest_baseline_assessment(self, batch_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM baseline_assessments WHERE batch_id=? ORDER BY epoch_id DESC, id DESC LIMIT 1",
+            (batch_id,)).fetchone()
+        if row is None:
+            return None
+        return self._assessment_row(row)
+
+    def unconfirmed_assessments(self, batch_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM baseline_assessments WHERE batch_id=? AND needs_confirmation=1 "
+            "AND confirmed_at IS NULL ORDER BY epoch_id, id", (batch_id,))
+        return [self._assessment_row(row) for row in rows]
+
+    def _assessment_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for field in ("prior_findings", "updated_findings", "jump_evidence"):
+            result[field] = json.loads(result[field])
+        result["needs_confirmation"] = bool(result["needs_confirmation"])
+        result["applied"] = bool(result["applied"])
+        return result
+
+    def mark_batch_baseline(self, batch_id: int, epoch_id: int, status: str,
+                            findings: list[dict[str, Any]]) -> None:
+        self.connection.execute(
+            "UPDATE batches SET baseline_epoch_id=?, status=?, findings=? WHERE id=?",
+            (epoch_id, status, canonical_bytes(findings).decode(), batch_id))
+
+    def confirm_baseline_assessment(self, assessment_id: int) -> None:
+        self.connection.execute(
+            "UPDATE baseline_assessments SET confirmed_at=? WHERE id=? AND confirmed_at IS NULL",
+            (utc_now(), assessment_id))
+
+    def epochs_for_trigger(self, trigger_batch_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM baseline_epochs WHERE trigger_batch_id=? ORDER BY id", (trigger_batch_id,))
+        results = []
+        for row in rows:
+            result = dict(row)
+            result["corrected_periods"] = json.loads(result["corrected_periods"])
+            results.append(result)
+        return results
+
+    def batches_for_series(self, source: str, indicator: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT DISTINCT b.* FROM batches b JOIN measurements m ON m.batch_id=b.id "
+            "WHERE b.source=? AND m.indicator=? ORDER BY b.id", (source, indicator))
+        return [self._batch(row) for row in rows]
